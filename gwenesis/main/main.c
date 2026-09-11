@@ -1,0 +1,1029 @@
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <rg_system.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+
+#undef BIT
+#include <gwenesis.h>
+
+#define AUDIO_SAMPLE_RATE (44100)
+#define AUDIO_BUFFER_LENGTH (1024) // Enough for 44.1kHz at 50Hz (882) plus jitter
+
+extern unsigned char *VRAM;
+int system_clock;
+int scan_line;
+
+extern unsigned char gwenesis_vdp_regs[0x20];
+extern unsigned short gwenesis_vdp_status;
+extern unsigned short *CRAM565;
+extern int screen_width, screen_height;
+extern int hint_pending;
+extern int zclk;
+extern bool gwenesis_cram_dirty;
+
+// Audio buffers MUST be in internal DRAM (not PSRAM) because:
+// 1. I2S DMA accesses them directly; if in PSRAM, the SPI clock divider at OC3+
+//    (/8 instead of /7) causes DMA stalls and complete audio silence.
+// 2. DRAM_ATTR forces placement in .dram0.data (fast internal SRAM, writable).
+//    NOTE: Do NOT use IRAM_ATTR here — that targets .iram0.text (instruction RAM),
+//    which is read-only on ESP32-S3 and would cause a CPU exception on writes.
+// Audio buffers in internal DRAM
+DRAM_ATTR int16_t gwenesis_sn76489_buffer[AUDIO_BUFFER_LENGTH];
+int sn76489_index;
+int sn76489_clock;
+DRAM_ATTR int16_t gwenesis_ym2612_buffer[AUDIO_BUFFER_LENGTH];
+int ym2612_index;
+int ym2612_clock;
+
+// Async Audio Sync
+#define AUDIO_BUFFER_COUNT 3
+typedef struct {
+    rg_audio_frame_t frames[AUDIO_BUFFER_LENGTH];
+    size_t count;
+} audio_msg_t;
+
+static audio_msg_t audio_pool[AUDIO_BUFFER_COUNT];
+static QueueHandle_t audio_queue_empty;
+static QueueHandle_t audio_queue_full;
+
+static void audio_task(void *arg) {
+    while (1) {
+        audio_msg_t *msg;
+        if (xQueueReceive(audio_queue_full, &msg, portMAX_DELAY) == pdTRUE) {
+            if (msg == (audio_msg_t *)-1) break;
+            rg_audio_submit(msg->frames, msg->count);
+            xQueueSend(audio_queue_empty, &msg, portMAX_DELAY);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+static FILE *savestate_fp = NULL;
+static int savestate_errors = 0;
+
+static bool yfm_enabled = true;
+static bool z80_enabled = true;
+static bool sn76489_enabled = true;
+
+static rg_surface_t *updates[2];
+static rg_surface_t *currentUpdate;
+static rg_app_t *app;
+
+static const char *SETTING_YFM_EMULATION = "yfm_enable";
+static const char *SETTING_Z80_EMULATION = "z80_enable";
+static const char *SETTING_SN76489_EMULATION = "sn_enable";
+
+static int btn_a_map = 1;     // Default: B
+static int btn_b_map = 0;     // Default: A
+static int btn_c_map = 2;     // Default: Select
+static int btn_start_map = 3; // Default: Start
+
+static const char *btn_names[] = {"A", "B", "Select", "Start"};
+static const uint32_t btn_keys[] = {RG_KEY_A, RG_KEY_B, RG_KEY_SELECT,
+                                    RG_KEY_START};
+
+static uint32_t keymap[8] = {RG_KEY_UP, RG_KEY_DOWN, RG_KEY_LEFT, RG_KEY_RIGHT,
+                             RG_KEY_B,  RG_KEY_A,    RG_KEY_SELECT, RG_KEY_START};
+
+static struct {
+  int *val;
+  const char *key;
+  int index;
+} btn_configs[4] = {
+    {&btn_a_map, "btn_a", 4},
+    {&btn_b_map, "btn_b", 5},
+    {&btn_c_map, "btn_c", 6},
+    {&btn_start_map, "btn_start", 7},
+};
+
+static bool turbo_a_toggled = false;
+static bool turbo_b_toggled = false;
+static bool menu_cancelled = false;
+static int turbo_counter = 0;
+
+IRAM_ATTR static void gwenesis_audio_mix_and_submit(size_t count) {
+  if (count == 0) return;
+  if (count > AUDIO_BUFFER_LENGTH) count = AUDIO_BUFFER_LENGTH;
+  
+  audio_msg_t *msg;
+  // Sound Center Sync: Wait for an empty buffer (controlled by audio hardware speed)
+  if (xQueueReceive(audio_queue_empty, &msg, portMAX_DELAY) == pdTRUE) {
+      if (yfm_enabled && sn76489_enabled) {
+        for (size_t i = 0; i < count; i++) {
+          int32_t mono = 0;
+          if (i < ym2612_index) mono += gwenesis_ym2612_buffer[i];
+          if (i < sn76489_index) mono += gwenesis_sn76489_buffer[i];
+          if (mono > 32767) mono = 32767; 
+          else if (mono < -32768) mono = -32768;
+          msg->frames[i].left = (int16_t)mono;
+          msg->frames[i].right = (int16_t)mono;
+        }
+      } else if (yfm_enabled) {
+        for (size_t i = 0; i < count; i++) {
+          int16_t mono = (i < ym2612_index) ? gwenesis_ym2612_buffer[i] : 0;
+          msg->frames[i].left = mono;
+          msg->frames[i].right = mono;
+        }
+      } else if (sn76489_enabled) {
+        for (size_t i = 0; i < count; i++) {
+          int16_t mono = (i < sn76489_index) ? gwenesis_sn76489_buffer[i] : 0;
+          msg->frames[i].left = mono;
+          msg->frames[i].right = mono;
+        }
+      } else {
+        memset(msg->frames, 0, count * sizeof(rg_audio_frame_t));
+      }
+      msg->count = count;
+      xQueueSend(audio_queue_full, &msg, portMAX_DELAY);
+  }
+}
+
+static void sync_audio_to_system() {
+  double freq = rg_system_get_cpu_speed();
+  if (freq < 100) freq = 240.0;
+  
+  // The "Universal S3 Sync Formula":
+  // We scale the 44.1kHz rate based on the ratio of Nominal(240) to Current(freq).
+  // We add a +0.4 offset to the frequency denominator to compensate for the 
+  // I2S fractional divider's rounding behavior on the S3 hardware.
+  double target_rate = 44100.0 * (240.0 / (freq + 0.4));
+  
+  rg_audio_set_sample_rate((int)target_rate);
+  
+  // Keep emulator production rate at exactly 44.1kHz
+  YM2612Config(14, 1218); 
+  gwenesis_SN76489_Init(MCLOCK_NTSC, 44100, 1218);
+  
+  RG_LOGI("Dynamic Sync: Rate=%dHz (Offset=0.4) for %.1fMHz\n", (int)target_rate, freq);
+}
+
+static void load_config();
+static void save_config();
+
+// --- MAIN
+
+typedef struct {
+  char key[28];
+  uint32_t length;
+} svar_t;
+
+SaveState *saveGwenesisStateOpenForRead(const char *fileName) {
+  return (void *)1;
+}
+
+SaveState *saveGwenesisStateOpenForWrite(const char *fileName) {
+  return (void *)1;
+}
+
+int saveGwenesisStateGet(SaveState *state, const char *tagName) {
+  int value = 0;
+  saveGwenesisStateGetBuffer(state, tagName, &value, sizeof(int));
+  return value;
+}
+
+void saveGwenesisStateSet(SaveState *state, const char *tagName, int value) {
+  saveGwenesisStateSetBuffer(state, tagName, &value, sizeof(int));
+}
+
+void saveGwenesisStateGetBuffer(SaveState *state, const char *tagName,
+                                void *buffer, int length) {
+  size_t initial_pos = ftell(savestate_fp);
+  bool from_start = false;
+  svar_t var;
+
+  // Odds are that calls to this func will be in order, so try searching from
+  // current file position.
+  while (!from_start || ftell(savestate_fp) < initial_pos) {
+    if (!fread(&var, sizeof(svar_t), 1, savestate_fp)) {
+      if (!from_start) {
+        fseek(savestate_fp, 0, SEEK_SET);
+        from_start = true;
+        continue;
+      }
+      break;
+    }
+    if (strncmp(var.key, tagName, sizeof(var.key)) == 0) {
+      int to_read = RG_MIN(var.length, length);
+      fread(buffer, to_read, 1, savestate_fp);
+      if (var.length > to_read) {
+        fseek(savestate_fp, var.length - to_read, SEEK_CUR);
+      }
+      // RG_LOGI("Loaded key '%s'\n", tagName);
+      return;
+    }
+    fseek(savestate_fp, var.length, SEEK_CUR);
+  }
+  RG_LOGW("Key %s NOT FOUND!\n", tagName);
+  savestate_errors++;
+}
+
+void saveGwenesisStateSetBuffer(SaveState *state, const char *tagName,
+                                void *buffer, int length) {
+  // TO DO: seek the file to find if the key already exists. It's possible it
+  // could be written twice.
+  svar_t var = {{0}, length};
+  strncpy(var.key, tagName, sizeof(var.key) - 1);
+  fwrite(&var, sizeof(var), 1, savestate_fp);
+  fwrite(buffer, length, 1, savestate_fp);
+  // RG_LOGI("Saved key '%s'\n", tagName);
+}
+
+
+static rg_gui_event_t yfm_update_cb(rg_gui_option_t *option,
+                                    rg_gui_event_t event) {
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    yfm_enabled = !yfm_enabled;
+    rg_settings_set_number(NS_APP, SETTING_YFM_EMULATION, yfm_enabled);
+  }
+  strcpy(option->value, yfm_enabled ? _("On") : _("Off"));
+
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t sn76489_update_cb(rg_gui_option_t *option,
+                                        rg_gui_event_t event) {
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    sn76489_enabled = !sn76489_enabled;
+    rg_settings_set_number(NS_APP, SETTING_SN76489_EMULATION, sn76489_enabled);
+  }
+  strcpy(option->value, sn76489_enabled ? _("On") : _("Off"));
+
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t z80_update_cb(rg_gui_option_t *option,
+                                    rg_gui_event_t event) {
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    z80_enabled = !z80_enabled;
+    rg_settings_set_number(NS_APP, SETTING_Z80_EMULATION, z80_enabled);
+    if (!z80_enabled) {
+      zclk = 0x1000000;
+    } else {
+      zclk = 0;
+    }
+  }
+  strcpy(option->value, z80_enabled ? _("On") : _("Off"));
+
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t sub_btn_mapping_cb(rg_gui_option_t *option,
+                                         rg_gui_event_t event) {
+  int i = (int)option->arg;
+  int *val = btn_configs[i].val;
+  int index = btn_configs[i].index;
+
+  if (event == RG_DIALOG_PREV)
+    *val = (*val + 3) % 4;
+  if (event == RG_DIALOG_NEXT)
+    *val = (*val + 1) % 4;
+
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    keymap[index] = btn_keys[*val];
+  }
+
+  strcpy(option->value, btn_names[*val]);
+
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t btn_mapping_cb(rg_gui_option_t *option,
+                                     rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) {
+    rg_gui_option_t options[7];
+    options[0] = (rg_gui_option_t){0, _("Button A"), "-", RG_DIALOG_FLAG_NORMAL,
+                                   &sub_btn_mapping_cb};
+    options[1] = (rg_gui_option_t){1, _("Button B"), "-", RG_DIALOG_FLAG_NORMAL,
+                                   &sub_btn_mapping_cb};
+    options[2] = (rg_gui_option_t){2, _("Button C"), "-", RG_DIALOG_FLAG_NORMAL,
+                                   &sub_btn_mapping_cb};
+    options[3] = (rg_gui_option_t){3, _("Button Start"), "-",
+                                   RG_DIALOG_FLAG_NORMAL, &sub_btn_mapping_cb};
+    options[4] = (rg_gui_option_t)RG_DIALOG_END;
+
+    rg_gui_dialog(option->label, options, 0);
+    save_config();
+  }
+  return RG_DIALOG_VOID;
+}
+
+static bool screenshot_handler(const char *filename, int width, int height) {
+  return rg_surface_save_image_file(currentUpdate, filename, width, height);
+}
+
+static bool save_state_handler(const char *filename) {
+  if ((savestate_fp = fopen(filename, "wb"))) {
+    savestate_errors = 0;
+    gwenesis_save_state();
+    fclose(savestate_fp);
+    return savestate_errors == 0;
+  }
+  return false;
+}
+
+static bool load_state_handler(const char *filename) {
+  if ((savestate_fp = fopen(filename, "rb"))) {
+    savestate_errors = 0;
+    gwenesis_load_state();
+    fclose(savestate_fp);
+    if (savestate_errors == 0) {
+      m68k.cycles = 0;
+      if (z80_enabled) zclk = 0;
+      sync_audio_to_system();
+      rg_system_set_tick_rate(REG1_PAL ? 50 : 60);
+      gwenesis_cram_dirty = true;
+      return true;
+    }
+  }
+  reset_emulation();
+  return false;
+}
+
+static bool reset_handler(bool hard) {
+  reset_emulation();
+  return true;
+}
+
+static void event_handler(int event, void *arg) {
+  if (event == RG_EVENT_REDRAW) {
+    rg_display_submit(currentUpdate, 0);
+  }
+}
+
+static rg_gui_event_t overclock_cb(rg_gui_option_t *option, rg_gui_event_t event) {
+  int level = rg_system_get_overclock();
+  if (event == RG_DIALOG_PREV) level = (level + 4) % 5;
+  if (event == RG_DIALOG_NEXT) level = (level + 1) % 5;
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    rg_system_set_overclock(level);
+    sync_audio_to_system(); // Recalculate sync for new speed
+    rg_settings_set_number(NS_APP, "overclock", level);
+  }
+  const char *names[] = {"0 (240MHz)", "1 (240MHz)", "2 (260MHz)", "3 (280MHz)", "4 (300MHz)"};
+  strcpy(option->value, names[level % 5]);
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t frameskip_cb(rg_gui_option_t *option, rg_gui_event_t event) {
+  int val = rg_settings_get_number(NS_APP, "frameskip", 0); // 0=Off, 1=Auto, 2=1, 3=2, 4=3, 5=4
+  if (event == RG_DIALOG_PREV) val = (val + 5) % 6;
+  if (event == RG_DIALOG_NEXT) val = (val + 1) % 6;
+  if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT) {
+    rg_settings_set_number(NS_APP, "frameskip", val);
+    if (val == 0) app->frameskip = -1;      // Off
+    else if (val == 1) app->frameskip = 0; // Auto
+    else app->frameskip = val - 1;         // 1, 2, 3, 4
+  }
+  const char *names[] = {_("Off"), _("Auto"), "1", "2", "3", "4"};
+  strcpy(option->value, names[val % 6]);
+  return RG_DIALOG_VOID;
+}
+
+// --- CHEATS
+
+static void apply_cheat_code(const char *code, const char *name, bool status) {
+  uint32_t addr;
+  uint16_t val;
+  uint8_t size;
+
+  if (!md_cheat_decode_par(code, &addr, &val, &size)) {
+    RG_LOGE("Invalid PAR code: %s\n", code);
+    return;
+  }
+
+  // Use description format: "NAME|CODE"
+  char full_desc[128];
+  snprintf(full_desc, sizeof(full_desc), "%s|%s", name ? name : "Cheat", code);
+  md_cheat_add(full_desc, addr, val, size, status);
+}
+
+static void load_cheats(void) {
+  char *path = rg_emu_get_path(RG_PATH_SAVE_SRAM, app->romPath);
+  if (!path) return;
+
+  char *saves_str = strstr(path, "saves");
+  if (saves_str) memcpy(saves_str, "cheat", 5);
+
+  char *ext = strrchr(path, '.');
+  if (ext) strcpy(ext, ".cht");
+
+  void *buffer = NULL;
+  size_t size = 0;
+  if (!rg_storage_read_file(path, &buffer, &size, 0)) {
+    free(path);
+    return;
+  }
+
+  md_cheat_reset();
+
+  char *line = strtok((char *)buffer, "\r\n");
+  while (line) {
+    char *sep1 = strchr(line, '|');
+    if (sep1) {
+      *sep1 = 0;
+      char *name = line;
+      char *code_part = sep1 + 1;
+      int status = 1; // Default to ON
+
+      char *sep2 = strchr(code_part, '|');
+      if (sep2) {
+        *sep2 = 0;
+        char *status_str = sep2 + 1;
+        if (strcmp(status_str, "OFF") == 0) status = 0;
+      }
+      apply_cheat_code(code_part, name, status);
+    }
+    line = strtok(NULL, "\r\n");
+  }
+
+  free(buffer);
+  free(path);
+}
+
+static void save_cheats(void) {
+  char *path = rg_emu_get_path(RG_PATH_SAVE_SRAM, app->romPath);
+  if (!path) return;
+
+  char *saves_str = strstr(path, "saves");
+  if (saves_str) memcpy(saves_str, "cheat", 5);
+
+  rg_storage_mkdir(rg_dirname(path));
+
+  char *ext = strrchr(path, '.');
+  if (ext) strcpy(ext, ".cht");
+
+  const size_t buffer_size = 16384; 
+  char *buffer = malloc(buffer_size);
+  if (!buffer) {
+    free(path);
+    return;
+  }
+  buffer[0] = 0;
+  size_t offset = 0;
+
+  for (int i = 0; i < 64; i++) {
+    uint32_t a;
+    uint16_t v;
+    uint8_t sz;
+    bool s;
+    char *full_name = NULL;
+    if (!md_cheat_get(i, &full_name, &a, &v, &sz, &s)) break;
+
+    if (full_name) {
+      int len = snprintf(buffer + offset, buffer_size - offset, "%s|%s\n", 
+                         full_name, s ? "ON" : "OFF");
+      if (len > 0 && offset + len < buffer_size) offset += len;
+      else break;
+    }
+  }
+
+  if (offset > 0) rg_storage_write_file(path, buffer, offset, 0);
+  else rg_storage_delete(path);
+
+  free(buffer);
+  free(path);
+}
+
+static int last_cheat_sel = 0;
+static rg_gui_event_t cheat_toggle_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (!opt) return RG_DIALOG_VOID;
+
+  int index = (int)opt->arg;
+  uint32_t a;
+  uint16_t v;
+  uint8_t sz;
+  bool s;
+  char *name = NULL;
+
+  if (event == RG_DIALOG_INIT || event == RG_DIALOG_UPDATE) {
+    if (opt->value && md_cheat_get(index, &name, &a, &v, &sz, &s)) {
+      strcpy(opt->value, s ? _("On") : _("Off"));
+    }
+    return RG_DIALOG_VOID;
+  }
+
+  if (event != RG_DIALOG_ENTER && event != RG_DIALOG_SELECT) return RG_DIALOG_VOID;
+
+  if (md_cheat_get(index, &name, &a, &v, &sz, &s)) {
+    md_cheat_set(index, !s);
+    save_cheats();
+    return RG_DIALOG_UPDATE;
+  }
+  return RG_DIALOG_VOID;
+}
+
+static void handle_cheat_menu(void) {
+  static rg_gui_option_t choices[32];
+  static char choices_names[32][64];
+
+  while (true) {
+    int count = 0;
+    for (int i = 0; i < 30; i++) {
+      uint32_t a;
+      uint16_t v;
+      uint8_t sz;
+      bool s;
+      char *full_name = NULL;
+      if (!md_cheat_get(i, &full_name, &a, &v, &sz, &s)) break;
+      if (!full_name) continue;
+
+      char *sep = strchr(full_name, '|');
+      if (sep) {
+        size_t len = RG_MIN(sep - full_name, 60);
+        strncpy(choices_names[count], full_name, len);
+        choices_names[count][len] = 0;
+      } else {
+        strncpy(choices_names[count], full_name, 63);
+        choices_names[count][63] = 0;
+      }
+
+      choices[count].flags = RG_DIALOG_FLAG_NORMAL;
+      choices[count].label = choices_names[count];
+      choices[count].value = (char *)(s ? _("On") : _("Off"));
+      choices[count].update_cb = cheat_toggle_cb;
+      choices[count].arg = (intptr_t)i;
+      count++;
+    }
+
+    if (count == 0) {
+      rg_gui_alert(_("Pro Action Replay"), _("No codes active. Use 'Load' or 'Add Code'."));
+      break;
+    }
+    choices[count++] = (rg_gui_option_t)RG_DIALOG_END;
+
+    intptr_t sel_arg = rg_gui_dialog(_("Pro Action Replay"), choices, last_cheat_sel);
+
+    if (sel_arg == RG_DIALOG_CANCELLED) break;
+  }
+}
+
+static void handle_add_cheat_menu(void) {
+  char *code = rg_gui_input_str(_("Add Pro Action Replay Code"), _("Enter Code (XXXXXX:YYYY)"), "");
+  if (code) {
+    char *name = rg_gui_input_str(_("Add Pro Action Replay Code"), _("Enter Description"), "");
+
+
+    if (name) {
+      apply_cheat_code(code, name, true);
+      save_cheats();
+      rg_gui_alert(_("Add Cheat"), _("Cheat added successfully."));
+      free(name);
+    }
+    free(code);
+  }
+}
+
+static void handle_delete_cheat_menu(void) {
+  static rg_gui_option_t choices[32];
+  static char choices_names[32][64];
+
+  while (true) {
+    int count = 0;
+    for (int i = 0; i < 30; i++) {
+      uint32_t a;
+      uint16_t v;
+      uint8_t sz;
+      bool s;
+      char *full_name = NULL;
+      if (!md_cheat_get(i, &full_name, &a, &v, &sz, &s)) break;
+      if (!full_name) continue;
+
+      char *sep = strchr(full_name, '|');
+      if (sep) {
+        size_t len = RG_MIN(sep - full_name, 60);
+        strncpy(choices_names[count], full_name, len);
+        choices_names[count][len] = 0;
+      } else {
+        strncpy(choices_names[count], full_name, 63);
+        choices_names[count][63] = 0;
+      }
+
+      choices[count].flags = RG_DIALOG_FLAG_NORMAL;
+      choices[count].label = choices_names[count];
+      choices[count].value = NULL;
+      choices[count].arg = (intptr_t)i;
+      count++;
+    }
+
+    if (count == 0) {
+      rg_gui_alert(_("Delete Cheats"), _("No cheats to delete."));
+      break;
+    }
+    choices[count++] = (rg_gui_option_t)RG_DIALOG_END;
+
+    intptr_t sel_arg = rg_gui_dialog(_("Select Cheat to Delete"), choices, 0);
+    if (sel_arg == RG_DIALOG_CANCELLED) break;
+    if (sel_arg >= 0 && sel_arg < 30) {
+      md_cheat_del((uint32_t)sel_arg);
+      save_cheats();
+    }
+  }
+}
+
+static rg_gui_event_t handle_load_cheats_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) {
+    load_cheats();
+    rg_gui_alert(_("Pro Action Replay"), _("Codes loaded from SD Card."));
+  }
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t handle_save_cheats_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) {
+    save_cheats();
+    rg_gui_alert(_("Pro Action Replay"), _("Codes saved to SD Card."));
+  }
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t handle_cheat_list_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) handle_cheat_menu();
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t handle_add_cheat_menu_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) handle_add_cheat_menu();
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t handle_delete_cheat_menu_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) handle_delete_cheat_menu();
+  return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t handle_cheat_menu_cb(rg_gui_option_t *opt, rg_gui_event_t event) {
+  if (event == RG_DIALOG_ENTER) {
+    const rg_gui_option_t choices[] = {
+        {0, _("Active Codes"), ">", RG_DIALOG_FLAG_NORMAL, &handle_cheat_list_cb},
+        {0, _("Add Pro Action Replay Code"), "-", RG_DIALOG_FLAG_NORMAL, &handle_add_cheat_menu_cb},
+        {0, _("Delete Code"), "-", RG_DIALOG_FLAG_NORMAL, &handle_delete_cheat_menu_cb},
+        {0, _("Load from SD"), "-", RG_DIALOG_FLAG_NORMAL, &handle_load_cheats_cb},
+        {0, _("Save to SD"), "-", RG_DIALOG_FLAG_NORMAL, &handle_save_cheats_cb},
+        RG_DIALOG_END};
+    rg_gui_dialog(_("Pro Action Replay"), choices, 0);
+    save_cheats();
+  }
+  return RG_DIALOG_VOID;
+}
+
+static void options_handler(rg_gui_option_t *dest) {
+  *dest++ = (rg_gui_option_t){0, _("Pro Action Replay"), ">", RG_DIALOG_FLAG_NORMAL, &handle_cheat_menu_cb};
+
+
+  *dest++ = (rg_gui_option_t){0, _("YM2612 audio "), "-", RG_DIALOG_FLAG_NORMAL, &yfm_update_cb};
+  *dest++ = (rg_gui_option_t){0, _("SN76489 audio"), "-", RG_DIALOG_FLAG_NORMAL, &sn76489_update_cb};
+  *dest++ = (rg_gui_option_t){0, _("Z80 emulation"), "-", RG_DIALOG_FLAG_NORMAL, &z80_update_cb};
+  *dest++ = (rg_gui_option_t){0, _("Frameskip"), "-", RG_DIALOG_FLAG_NORMAL, &frameskip_cb};
+  *dest++ = (rg_gui_option_t){0, _("Map Buttons"), "...", RG_DIALOG_FLAG_NORMAL, &btn_mapping_cb};
+  *dest++ = (rg_gui_option_t){0, _("Overclock"), "-", RG_DIALOG_FLAG_NORMAL, &overclock_cb};
+  *dest++ = (rg_gui_option_t)RG_DIALOG_END;
+}
+
+static void load_config() {
+  char path[RG_PATH_MAX];
+  snprintf(path, sizeof(path), "%s/md/%s.cfg", RG_BASE_PATH_CONFIG,
+           rg_basename(app->romPath));
+
+  void *data = NULL;
+  size_t size = 0;
+  if (rg_storage_read_file(path, &data, &size, 0)) {
+    if (size >= sizeof(int) * 4) {
+      int *vals = (int *)data;
+      btn_a_map = vals[0];
+      btn_b_map = vals[1];
+      btn_c_map = vals[2];
+      btn_start_map = vals[3];
+      RG_LOGI("Config loaded from %s\n", path);
+    }
+    free(data);
+  }
+
+  keymap[4] = btn_keys[btn_a_map];
+  keymap[5] = btn_keys[btn_b_map];
+  keymap[6] = btn_keys[btn_c_map];
+  keymap[7] = btn_keys[btn_start_map];
+}
+
+static void save_config() {
+  char path[RG_PATH_MAX];
+  snprintf(path, sizeof(path), "%s/md/%s.cfg", RG_BASE_PATH_CONFIG,
+           rg_basename(app->romPath));
+           
+  rg_storage_mkdir(rg_dirname(path));
+
+  int vals[4] = {btn_a_map, btn_b_map, btn_c_map, btn_start_map};
+  if (rg_storage_write_file(path, vals, sizeof(vals), 0)) {
+    RG_LOGI("Config saved to %s\n", path);
+  }
+}
+
+void app_main(void) {
+  const rg_handlers_t handlers = {
+      .loadState = &load_state_handler,
+      .saveState = &save_state_handler,
+      .reset = &reset_handler,
+      .screenshot = &screenshot_handler,
+      .event = &event_handler,
+      .options = &options_handler,
+  };
+
+  app = rg_system_init(AUDIO_SAMPLE_RATE, &handlers, NULL);
+  app->screenSync = 0; // Sound Centered Sync (Master Clock)
+  
+  // Initialize Async Audio
+  audio_queue_full = xQueueCreate(1, sizeof(audio_msg_t *));
+  audio_queue_empty = xQueueCreate(AUDIO_BUFFER_COUNT, sizeof(audio_msg_t *));
+  for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
+    audio_msg_t *msg = &audio_pool[i];
+    xQueueSend(audio_queue_empty, &msg, 0);
+  }
+  xTaskCreatePinnedToCore(&audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
+
+  int fs_val = rg_settings_get_number(NS_APP, "frameskip", 1); // Default to 1 (Auto)
+  if (fs_val == 0) app->frameskip = -1;      // Off
+  else if (fs_val == 1) app->frameskip = 0; // Auto
+  else app->frameskip = fs_val - 1;         // 1, 2, 3, 4
+  // Only set default overclock=2 if the user hasn't saved a per-ROM preference.
+  // NS_FILE overclock was already loaded by rg_system_init — don't override it.
+  if (!rg_settings_exists(NS_FILE, "overclock")) {
+    rg_system_set_overclock(2);
+  }
+  sync_audio_to_system(); // Synchronize audio with the final clock speed
+
+  yfm_enabled = rg_settings_get_number(NS_APP, SETTING_YFM_EMULATION, 1);
+  sn76489_enabled = rg_settings_get_number(NS_APP, SETTING_SN76489_EMULATION, 1);
+  z80_enabled = rg_settings_get_number(NS_APP, SETTING_Z80_EMULATION, 1);
+
+  md_cheat_init();
+  load_cheats();
+
+  load_config();
+
+
+  updates[0] = rg_surface_create(320, 241, RG_PIXEL_PAL565_BE, MEM_FAST);
+  // updates[1] = rg_surface_create(320, 241, RG_PIXEL_PAL565_BE, MEM_FAST);
+  currentUpdate = updates[0];
+
+  // This is a hack because our new surface format doesn't yet support overdraw
+  // space easily
+  updates[0]->data += 160;
+  updates[0]->height = 240;
+  // updates[1]->data += 160;
+  // updates[1]->height = 240;
+
+
+  RG_LOGI("Genesis start\n");
+
+  size_t rom_size;
+  void *rom_data;
+
+  if (rg_extension_match(app->romPath, "zip")) {
+    if (!rg_storage_unzip_file(app->romPath, NULL, &rom_data, &rom_size,
+                               RG_FILE_ALIGN_64KB))
+      RG_PANIC("ROM file unzipping failed!");
+  } else if (!rg_storage_read_file(app->romPath, &rom_data, &rom_size,
+                                   RG_FILE_ALIGN_64KB)) {
+    RG_PANIC("ROM load failed!");
+  }
+
+  RG_LOGI("load_cartridge(%p, %zu)\n", rom_data, rom_size);
+  // In RETRO_GO mode, ROM_DATA = buffer (takes direct ownership, do NOT free).
+  // If not RETRO_GO, load_cartridge does memcpy internally so buffer can be freed after.
+  load_cartridge(rom_data, rom_size);
+  // rom_data is now owned by ROM_DATA pointer in gwenesis_bus.c — do not free!
+
+  RG_LOGI("power_on()\n");
+  power_on();
+
+  RG_LOGI("reset_emulation()\n");
+  reset_emulation();
+
+  if (app->bootFlags & RG_BOOT_RESUME) {
+    rg_emu_load_state(app->saveSlot);
+  }
+
+  rg_system_set_tick_rate(60);
+
+
+
+  zclk = z80_enabled ? 0 : 0x1000000;
+
+  // index: 0=Up, 1=Down, 2=Left, 3=Right, 4=Gen_A, 5=Gen_B, 6=Gen_C,
+  // 7=Gen_Start
+  uint32_t joystick = 0, joystick_old = 0, effective_old = 0;
+
+  int skipFrames = 0;
+
+  RG_LOGI("emulation loop\n");
+  while (!rg_system_exit_called()) {
+    joystick_old = joystick;
+    joystick = rg_input_read_gamepad();
+    uint32_t joystick_down = joystick & ~joystick_old;
+    turbo_counter++;
+
+    if (joystick & RG_KEY_MENU) {
+      if (joystick_down & RG_KEY_A) {
+        turbo_a_toggled = !turbo_a_toggled;
+        RG_LOGI("Turbo A: %s\n", turbo_a_toggled ? "ON" : "OFF");
+      }
+      if (joystick_down & RG_KEY_B) {
+        turbo_b_toggled = !turbo_b_toggled;
+        RG_LOGI("Turbo B: %s\n", turbo_b_toggled ? "ON" : "OFF");
+      }
+      if (joystick & ~RG_KEY_MENU) {
+        menu_cancelled = true;
+      }
+    } else {
+      if (joystick_old & RG_KEY_MENU) {
+        if (!menu_cancelled)
+          rg_gui_game_menu();
+        menu_cancelled = false;
+      }
+    }
+
+    if (joystick & RG_KEY_OPTION) {
+      rg_gui_options_menu();
+    }
+
+    uint32_t effective = joystick;
+    if (joystick & RG_KEY_MENU) {
+      effective = 0; // Don't pass inputs if menu is held (as modifier)
+    } else {
+      if (turbo_a_toggled && (joystick & RG_KEY_A) && (turbo_counter & 4))
+        effective &= ~RG_KEY_A;
+      if (turbo_b_toggled && (joystick & RG_KEY_B) && (turbo_counter & 4))
+        effective &= ~RG_KEY_B;
+    }
+
+    if (effective != effective_old) {
+      for (int i = 0; i < 8; i++) {
+        uint32_t key = keymap[i];
+        if ((effective & key) == key)
+          gwenesis_io_pad_press_button(0, i);
+        else
+          gwenesis_io_pad_release_button(0, i);
+      }
+      effective_old = effective;
+    }
+
+    int64_t startTime = rg_system_timer();
+    bool drawFrame = (skipFrames == 0);
+
+    int lines_per_frame = REG1_PAL ? LINES_PER_FRAME_PAL : LINES_PER_FRAME_NTSC;
+    int hint_counter = gwenesis_vdp_regs[10];
+
+    screen_width = REG12_MODE_H40 ? 320 : 256;
+    screen_height = REG1_PAL ? 240 : 224;
+
+    gwenesis_vdp_set_buffer(currentUpdate->data);
+    gwenesis_vdp_render_config();
+
+    /* Reset the difference clocks and audio index */
+    system_clock = 0;
+
+    ym2612_clock = yfm_enabled ? 0 : 0x1000000;
+    ym2612_index = 0;
+
+    sn76489_clock = sn76489_enabled ? 0 : 0x1000000;
+    sn76489_index = 0;
+
+    scan_line = 0;
+
+    while (scan_line < lines_per_frame) {
+      m68k_run(system_clock + VDP_CYCLES_PER_LINE);
+      z80_run(system_clock + VDP_CYCLES_PER_LINE);
+
+      /* Audio */
+      /*  GWENESIS_AUDIO_ACCURATE:
+       *    =1 : cycle accurate mode. audio is refreshed when CPUs are
+       * performing a R/W access =0 : line  accurate mode. audio is refreshed
+       * every lines.
+       */
+      if (GWENESIS_AUDIO_ACCURATE == 0) {
+        gwenesis_SN76489_run(system_clock + VDP_CYCLES_PER_LINE);
+        ym2612_run(system_clock + VDP_CYCLES_PER_LINE);
+      }
+
+      /* Video */
+      if (drawFrame && scan_line < screen_height)
+        gwenesis_vdp_render_line(scan_line); /* render scan_line */
+
+      // On these lines, the line counter interrupt is reloaded
+      if ((scan_line == 0) || (scan_line > screen_height)) {
+        //  if (REG0_LINE_INTERRUPT != 0)
+        //    printf("HINTERRUPT counter reloaded: (scan_line: %d, new
+        //    counter: %d)\n", scan_line, REG10_LINE_COUNTER);
+        hint_counter = REG10_LINE_COUNTER;
+      }
+
+      // interrupt line counter
+      if (--hint_counter < 0) {
+        if ((REG0_LINE_INTERRUPT != 0) && (scan_line <= screen_height)) {
+          hint_pending = 1;
+          // printf("Line int pending %d\n",scan_line);
+          if ((gwenesis_vdp_status & STATUS_VIRQPENDING) == 0)
+            m68k_update_irq(4);
+        }
+        hint_counter = REG10_LINE_COUNTER;
+      }
+
+      scan_line++;
+
+      // vblank begin at the end of last rendered line
+      if (scan_line == screen_height) {
+        if (REG1_VBLANK_INTERRUPT != 0) {
+          gwenesis_vdp_status |= STATUS_VIRQPENDING;
+          m68k_set_irq(6);
+        }
+        z80_irq_line(1);
+      }
+      if (scan_line == (screen_height + 1)) {
+        z80_irq_line(0);
+      }
+
+      system_clock += VDP_CYCLES_PER_LINE;
+    }
+
+    /* Audio
+     * synchronize YM2612 and SN76489 to system_clock
+     * it completes the missing audio sample for accurate audio mode
+     */
+    if (GWENESIS_AUDIO_ACCURATE == 1) {
+      gwenesis_SN76489_run(system_clock);
+      ym2612_run(system_clock);
+    }
+    
+    md_cheat_apply();
+
+
+    // reset m68k & z80 cycles to the begin of next frame cycle
+    m68k.cycles -= system_clock;
+    if (z80_enabled) zclk -= system_clock;
+
+    if (drawFrame) {
+      if (gwenesis_cram_dirty) {
+        for (int i = 0; i < 64; ++i)
+          currentUpdate->palette[i] = (CRAM565[i] << 8) | (CRAM565[i] >> 8);
+        memcpy(&currentUpdate->palette[64],  &currentUpdate->palette[0], 64 * sizeof(uint16_t));
+        memcpy(&currentUpdate->palette[128], &currentUpdate->palette[0], 64 * sizeof(uint16_t));
+        memcpy(&currentUpdate->palette[192], &currentUpdate->palette[0], 64 * sizeof(uint16_t));
+        gwenesis_cram_dirty = false;
+      }
+      currentUpdate->width = screen_width;
+      currentUpdate->height = screen_height;
+      rg_display_submit(currentUpdate, 0); 
+    }
+
+    // Audio-Clock Sync: Let audio hardware drive the emulator speed
+    if (yfm_enabled || sn76489_enabled) {
+      size_t count = (ym2612_index > sn76489_index) ? ym2612_index : sn76489_index;
+      if (count > AUDIO_BUFFER_LENGTH) count = AUDIO_BUFFER_LENGTH;
+      gwenesis_audio_mix_and_submit(count); 
+    }
+
+    // Capture Busy Time
+    int64_t busyTime = rg_system_timer() - startTime;
+    rg_system_tick(busyTime);
+
+    // --- Robust Frameskip Manager ---
+    static int consecutive_skips = 0;
+
+    if (app->frameskip > 0) {
+      // Manual Frameskip
+      if (skipFrames > 0) skipFrames--;
+      else skipFrames = app->frameskip;
+    } else if (app->frameskip == 0) {
+      // Auto Frameskip: skip if busyTime > frameTime + 1ms slack
+      if (busyTime > (app->frameTime + 1000) && consecutive_skips < 3) {
+        skipFrames = 1;
+        consecutive_skips++;
+      } else {
+        skipFrames = 0;
+        consecutive_skips = 0;
+      }
+    } else {
+      // Off: Always draw
+      skipFrames = 0;
+    }
+    // --------------------------------
+  }
+
+  RG_LOGI("Genesis ended");
+
+  if (rom_data)
+    free(rom_data);
+
+  gwenesis_vdp_free();
+  gwenesis_bus_free();
+
+  rg_surface_free(updates[0]);
+  if (updates[1])
+    rg_surface_free(updates[1]);
+
+  rg_system_exit();
+}
