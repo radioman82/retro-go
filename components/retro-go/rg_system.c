@@ -389,15 +389,15 @@ static void platform_init(void)
 // Setup all SPI CS lines here in case we have a shared bus. A floating device could cause
 // problems during the initialization of the first peripherals...
 #if defined(RG_SCREEN_HOST) && defined(RG_GPIO_LCD_CS)
-    gpio_set_direction(RG_GPIO_LCD_CS, GPIO_MODE_OUTPUT);
-    gpio_set_level(RG_GPIO_LCD_CS, 1);
+//    gpio_set_direction(RG_GPIO_LCD_CS, GPIO_MODE_OUTPUT);
+//    gpio_set_level(RG_GPIO_LCD_CS, 1);
 #endif
 #if defined(RG_STORAGE_SDSPI_HOST) && defined(RG_GPIO_SDSPI_CS)
-    gpio_set_direction(RG_GPIO_SDSPI_CS, GPIO_MODE_OUTPUT);
-    gpio_set_level(RG_GPIO_SDSPI_CS, 1);
+//    gpio_set_direction(RG_GPIO_SDSPI_CS, GPIO_MODE_OUTPUT);
+//    gpio_set_level(RG_GPIO_SDSPI_CS, 1);
 #endif
 #if defined(RG_STORAGE_SDSPI_HOST) && defined(RG_GPIO_SDSPI_MISO)
-    gpio_set_pull_mode(RG_GPIO_SDSPI_MISO, GPIO_PULLUP_ONLY);
+//    gpio_set_pull_mode(RG_GPIO_SDSPI_MISO, GPIO_PULLUP_ONLY);
 #endif
 #ifdef RG_GPIO_LED
     gpio_set_direction(RG_GPIO_LED, GPIO_MODE_OUTPUT);
@@ -1297,12 +1297,12 @@ void rg_system_set_overclock(int level)
 #endif
 
     rom_i2c_writeReg(I2C_BBPLL, I2C_BBPLL_HOSTID, I2C_BBPLL_OC_DIV_7_0, div7_0);
-    
+
     rg_task_delay(50);
 
     // RTC clock isn't affected by the CPU or APB clocks, so it remains our only reliable time measurement
-    uint64_t t = esp_rtc_get_time_us(); 
-    uint32_t cc = xthal_get_ccount();   
+    uint64_t t = esp_rtc_get_time_us();
+    uint32_t cc = xthal_get_ccount();
     rg_usleep(100000);
     int real_mhz = (double)(xthal_get_ccount() - cc) / (esp_rtc_get_time_us() - t);
 
@@ -1313,7 +1313,7 @@ void rg_system_set_overclock(int level)
     // compensate. The external DAC uses the APLL which is an independant clock source, no need to correct.
     if (strcmp(rg_audio_get_sink()->name, "Ext DAC") != 0)
         rg_audio_set_sample_rate(app.sampleRate * (240.0 / real_mhz));
-    
+
     RG_LOGI("Updating UART baudrate...");
     uart_set_baudrate(0, 115200.0 * (240.0 / real_mhz));
     // esp_timer_impl_update_apb_freq(80.0 / 240.0 * real_mhz);
