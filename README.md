@@ -1,3 +1,184 @@
+# Retro-Go – ESP32-S3 / nano-s3 Fork
+
+This repository is a personal development fork of Retro-Go focused on the **ESP32-S3 DevKitC-1 N16R8** and a small SPI TFT based retro-gaming system.
+
+**Original project:** Retro-Go
+**Fork:** `radioman82/retro-go`
+**Development branch:** `nano-s3`
+
+This fork contains my hardware-specific adaptations, configuration changes, emulator work and documentation for the ESP32-S3 platform.
+
+> This is a development fork. Not all components described below are finished or fully integrated.
+
+---
+
+## Hardware
+
+### ESP32-S3
+
+Target board:
+
+* ESP32-S3 DevKitC-1
+* N16R8
+* ESP32-S3
+* 16 MB Flash
+* 8 MB PSRAM
+
+### ILI9341 SPI TFT
+
+Current display configuration:
+
+| Signal    |   GPIO |
+| --------- | -----: |
+| MOSI      | GPIO12 |
+| CLK       | GPIO48 |
+| DC        | GPIO47 |
+| RST       |  GPIO3 |
+| Backlight | GPIO39 |
+
+Touch functionality is **not used**.
+
+### SD card
+
+The SD card is connected through SPI:
+
+| Signal |   GPIO |
+| ------ | -----: |
+| MISO   |  GPIO9 |
+| MOSI   | GPIO11 |
+| CLK    | GPIO13 |
+| CS     | GPIO10 |
+
+The SD card is used for ROMs, disk images and emulator data.
+
+---
+
+## Input
+
+The current button configuration is:
+
+| Function |                GPIO |
+| -------- | ------------------: |
+| SELECT   |              GPIO16 |
+| START    |              GPIO17 |
+| MENU     |              GPIO18 |
+| OPTION   |               GPIO8 |
+| A        |              GPIO15 |
+| B        |               GPIO5 |
+| D-pad    | GPIO6 / GPIO7 (ADC) |
+
+The input handling has been adapted for the ESP32-S3 target.
+
+---
+
+## Current Development Status
+
+The ESP32-S3 port is actively being developed.
+
+### Working / tested
+
+* ESP32-S3 DevKitC-1 N16R8 target
+* Retro-Go builds successfully for ESP32-S3
+* ILI9341 SPI display
+* SD card support
+* ESP32-S3 input/button configuration
+* emulator-specific input adaptations
+* NGP build completed successfully
+* firmware binaries can be generated with ESP-IDF
+
+The current ESP32-S3 build system uses **ESP-IDF** rather than the Arduino build system used by some of the earlier experiments.
+
+---
+
+## Emulator Development
+
+Several emulator components have been tested or integrated on the ESP32-S3.
+
+The development focus is on getting the existing Retro-Go emulators running reliably on the ESP32-S3 while keeping the hardware configuration small and suitable for a handheld-style system.
+
+---
+
+## Amiga 500 Development
+
+An Amiga 500 emulator is currently being investigated for the ESP32-S3.
+
+The starting point is a separate ESP32 project:
+
+`amiga500-esp32`
+
+The existing implementation is being used as a source for the Amiga emulation components rather than rewriting the Amiga emulator from scratch.
+
+The existing ESP32-S3 A500 implementation has already demonstrated:
+
+* video output
+* audio output
+* button/input handling
+
+The current work is therefore focused on **cleanly integrating the Amiga emulation core into the ESP-IDF/Retro-Go environment**.
+
+### Current A500 status
+
+The A500 emulator is **not yet integrated into Retro-Go**.
+
+An earlier Arduino-based build attempt successfully compiled large parts of the emulator but ultimately failed during linking because the ESP32-S3 internal DRAM region was exceeded.
+
+This is considered a build/memory-layout issue of that port, not proof that Amiga emulation is impossible on the ESP32-S3.
+
+The planned approach is to:
+
+1. reuse the existing Amiga emulation code,
+2. separate the emulator core from the Arduino-specific code,
+3. use the ESP32-S3 PSRAM for large Amiga memory buffers,
+4. build the core using the existing ESP-IDF environment,
+5. reuse the already working video, audio and input implementation where appropriate,
+6. integrate the result into Retro-Go.
+
+The A500 port is therefore currently **experimental / work in progress**.
+
+---
+
+## Documentation
+
+Additional development documentation is included in:
+
+`Retro go mit esp32s3 R16N8.docx`
+
+This document records the ESP32-S3 Retro-Go development, hardware configuration and experiments carried out during the porting work.
+
+---
+
+## Build
+
+The ESP32-S3 target is built using the ESP-IDF based build system included with this fork.
+
+A successful application build produces an ESP32-S3 binary in the corresponding emulator `build` directory.
+
+For example:
+
+```text
+ngp/build/ngp.bin
+```
+
+The build output also provides the corresponding `idf.py` / `esptool` commands for flashing the application.
+
+---
+
+## Development Notes
+
+This repository is primarily a development project and should not be considered a finished distribution.
+
+Hardware configuration and emulator support may change as development continues.
+
+The goal is to maintain a documented ESP32-S3 based Retro-Go platform while experimenting with additional emulator support and hardware-specific improvements.
+
+---
+
+## Original Retro-Go
+
+This project is based on Retro-Go.
+
+Please refer to the original Retro-Go documentation and repository for the original project, supported platforms and licensing information.
+
 # Table of contents
 - [Description](#description)
 - [Installation](#installation)
