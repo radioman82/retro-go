@@ -45,7 +45,7 @@ Run `python rg_tool.py --help` to see all available flags and commands.
 For a smaller build you can also specify which apps you want, for example the launcher + DOOM only:
 1. `python rg_tool.py build-fw launcher prboom-go`
 
-Note that the app named `retro-core` contains the following emulators: NES, PCE, G&W, Lynx, and SMS/GG/COL. As such, these emulators cannot be selected individually. The reason for the bundling is simply size, together they account for a mere 700KB instead of almost 3MB when they were built separately.
+Note that the app named `retro-core` contains the following emulators: NES, PCE, G&W, Lynx, and SMS/GG/COL. As such, these emulators cannot be selected individually. The reason for the bundling is simply size, together they account for a mere 700KB instead of almost 3MB when they were built separately. Other systems are built as standalone apps: `gnuboy` (GB/GBC), `snes` (SNES), `gwenesis` (Mega Drive), `prboom-go` (DOOM), `fmsx` (MSX), `ngp` (Neo Geo Pocket / Color), `oswan` (WonderSwan / Color), and `a500` (Amiga 500).
 
 
 ## Flashing an image for the first time

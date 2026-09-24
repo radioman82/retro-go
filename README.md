@@ -77,14 +77,17 @@ The ESP32-S3 port is actively being developed.
 
 ### Working / tested
 
-* ESP32-S3 DevKitC-1 N16R8 target
-* Retro-Go builds successfully for ESP32-S3
-* ILI9341 SPI display
-* SD card support
+* ESP32-S3 DevKitC-1 N16R8 & Waveshare Nano-S3 targets
+* Retro-Go builds successfully for ESP32-S3 with ESP-IDF
+* ILI9341 & ST7789 SPI displays
+* SD card support (SPI)
 * ESP32-S3 input/button configuration
 * emulator-specific input adaptations
-* NGP build completed successfully
-* firmware binaries can be generated with ESP-IDF
+* **Neo Geo Pocket / Neo Geo Pocket Color** core (RACE!) integrated and functional
+* **WonderSwan / WonderSwan Color** core (Oswan) integrated and functional
+* **MSX / MSX2** core (fMSX) integrated
+* **Amiga 500** core (UAE4all / FAME-C) integrated (experimental, see [FAZIT.md](a500/FAZIT.md))
+* Firmware images and app partitions generated with `rg_tool.py`
 
 The current ESP32-S3 build system uses **ESP-IDF** rather than the Arduino build system used by some of the earlier experiments.
 
@@ -92,48 +95,45 @@ The current ESP32-S3 build system uses **ESP-IDF** rather than the Arduino build
 
 ## Emulator Development
 
-Several emulator components have been tested or integrated on the ESP32-S3.
+Several emulator components have been ported, adapted or integrated on the ESP32-S3.
 
-The development focus is on getting the existing Retro-Go emulators running reliably on the ESP32-S3 while keeping the hardware configuration small and suitable for a handheld-style system.
+### SNK Neo Geo Pocket & Neo Geo Pocket Color (RACE!)
 
----
+* **App Target:** `ngp/`
+* **Core Component:** `components/race/`
+* **Supported File Types:** `.ngp`, `.ngc`, `.zip`
+* **Partition Size:** 896 KB (`ngp` in `rg_tool.py`)
+* **Key Implementation Details:**
+  * Emulates the Toshiba TLCS-900H 16-bit CPU and Z80 sound co-processor.
+  * Native 160×152 rendering scaled into Retro-Go display buffers.
+  * **ESP32-S3 Audio Architecture:** Audio message buffers are strictly allocated in internal DRAM (`DRAM_ATTR audio_msg_t audio_pool[...]`) rather than PSRAM to guarantee jitter-free, glitch-free I2S DMA streaming without SPI bus contention.
+  * **Universal S3 Sync Formula:** Includes dynamic sample rate compensation to prevent APB/I2S clock drift during CPU frequency adjustments and overclocking.
+  * Dedicated FreeRTOS `audio_task` decoupled from the emulation loop via queues.
 
-## Amiga 500 Development
+### Bandai WonderSwan & WonderSwan Color (Oswan)
 
-An Amiga 500 emulator is currently being investigated for the ESP32-S3.
+* **App Target:** `oswan/`
+* **Core Component:** `components/oswan/`
+* **Supported File Types:** `.ws`, `.wsc`, `.zip`
+* **Partition Size:** 640 KB (`oswan` in `rg_tool.py`)
+* **Key Implementation Details:**
+  * Emulates the NEC V30MZ CPU core (`nec.c`) and custom WonderSwan hardware.
+  * Native 224×144 resolution with full monochrome and WonderSwan Color palette rendering (`WSRender.c`).
+  * Dedicated input mapping (`ws_input_poll`) supporting X-Pad and Y-Pad button modes mapped seamlessly to standard Retro-Go gamepad controls.
+  * WonderSwan Audio Processing Unit (APU) streaming audio directly into Retro-Go's DMA sound queue (`rg_audio_submit`).
+  * Save states and EEPROM persistence support (`WSFileio.c`).
 
-The starting point is a separate ESP32 project:
+### Amiga 500 Development (UAE4all / FAME-C)
 
-`amiga500-esp32`
-
-The existing implementation is being used as a source for the Amiga emulation components rather than rewriting the Amiga emulator from scratch.
-
-The existing ESP32-S3 A500 implementation has already demonstrated:
-
-* video output
-* audio output
-* button/input handling
-
-The current work is therefore focused on **cleanly integrating the Amiga emulation core into the ESP-IDF/Retro-Go environment**.
-
-### Current A500 status
-
-The A500 emulator is **not yet integrated into Retro-Go**.
-
-An earlier Arduino-based build attempt successfully compiled large parts of the emulator but ultimately failed during linking because the ESP32-S3 internal DRAM region was exceeded.
-
-This is considered a build/memory-layout issue of that port, not proof that Amiga emulation is impossible on the ESP32-S3.
-
-The planned approach is to:
-
-1. reuse the existing Amiga emulation code,
-2. separate the emulator core from the Arduino-specific code,
-3. use the ESP32-S3 PSRAM for large Amiga memory buffers,
-4. build the core using the existing ESP-IDF environment,
-5. reuse the already working video, audio and input implementation where appropriate,
-6. integrate the result into Retro-Go.
-
-The A500 port is therefore currently **experimental / work in progress**.
+* **App Target:** `a500/`
+* **Core Component:** `components/a500/`
+* **Supported File Types:** `.adf`, `.zip`
+* **Partition Size:** 2.0 MB (`a500` in `rg_tool.py`)
+* **Status:** Integrated into Retro-Go as an experimental proof-of-concept.
+  * Bootable into Kickstart 1.3 (`kick13.rom`), ADF floppy disk loading.
+  * Paula 4-channel DMA audio over I2S and 320×240 RGB565 display output.
+  * Gamepad joystick mode and selectable mouse mode via `SELECT`.
+  * Detailed architectural findings and performance analysis (comparing Musashi vs. UAE4all/FAME-C, PSRAM latency bottlenecks, and frame rates) are documented in [a500/FAZIT.md](a500/FAZIT.md).
 
 ---
 
@@ -141,25 +141,35 @@ The A500 port is therefore currently **experimental / work in progress**.
 
 Additional development documentation is included in:
 
-`Retro go mit esp32s3 R16N8.docx`
-
-This document records the ESP32-S3 Retro-Go development, hardware configuration and experiments carried out during the porting work.
+* `Retro go mit esp32s3 R16N8.docx`: Records early hardware tests and configurations.
+* [a500/FAZIT.md](a500/FAZIT.md): Comprehensive evaluation of the Amiga 500 port on ESP32-S3.
 
 ---
 
 ## Build
 
-The ESP32-S3 target is built using the ESP-IDF based build system included with this fork.
+The ESP32-S3 targets are built using `rg_tool.py` on top of the ESP-IDF environment.
 
-A successful application build produces an ESP32-S3 binary in the corresponding emulator `build` directory.
+To build specific emulator binaries:
 
-For example:
+```bash
+# Build Neo Geo Pocket
+python rg_tool.py --target esp32-s3-devkit build ngp
+
+# Build WonderSwan
+python rg_tool.py --target esp32-s3-devkit build oswan
+
+# Build all configured applications
+python rg_tool.py --target esp32-s3-devkit build
+```
+
+Successful builds generate the binaries in each app's `build` directory:
 
 ```text
 ngp/build/ngp.bin
+oswan/build/oswan.bin
+launcher/build/launcher.bin
 ```
-
-The build output also provides the corresponding `idf.py` / `esptool` commands for flashing the application.
 
 ---
 
@@ -200,7 +210,12 @@ optimized to reduce their cpu, memory, and flash needs without reducing compatib
 - Coleco: **Colecovision**
 - NEC: **PC Engine**
 - Atari: **Lynx**
+- SNK: **Neo Geo Pocket, Neo Geo Pocket Color** (Core: RACE!)
+- Bandai: **WonderSwan, WonderSwan Color** (Core: Oswan)
+- Microsoft / ASCII: **MSX, MSX2** (Core: fMSX)
+- Commodore: **Amiga 500** (Core: UAE4all / FAME-C, experimentell – siehe [FAZIT.md](a500/FAZIT.md))
 - Others: **DOOM** (including mods!)
+
 
 ### Retro-Go features:
 - In-game menu
