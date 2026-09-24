@@ -14,7 +14,7 @@ import zlib
 DEFAULT_TARGET = os.getenv("RG_TOOL_TARGET", "ESP32-S3-DEVKIT")
 DEFAULT_BAUD = os.getenv("RG_TOOL_BAUD", "1152000")
 DEFAULT_PORT = os.getenv("RG_TOOL_PORT", "COM4")
-DEFAULT_APPS = os.getenv("RG_TOOL_APPS", "launcher retro-core gnuboy snes prboom-go ngp gwenesis oswan fmsx quake-go wolf4sdl")
+DEFAULT_APPS = os.getenv("RG_TOOL_APPS", "launcher retro-core gnuboy snes prboom-go ngp gwenesis oswan fmsx a500")
 PROJECT_NAME = os.getenv("PROJECT_NAME", "Retro-Go")
 PROJECT_ICON = os.getenv("PROJECT_ICON", "assets/icon.raw")
 PROJECT_APPS = {
@@ -28,8 +28,7 @@ PROJECT_APPS = {
   'fmsx':         [0, 16, 1048576],  # 1 MB
   'oswan':        [0, 16, 655360],   # 640 KB
   'ngp':          [0, 16, 917504],   # 896 KB
-  'quake-go':     [0, 16, 2097152],  # 2 MB
-  'wolf4sdl':     [0, 16, 1048576],  # 1.0 MB
+  'a500':         [0, 16, 2097152],  # 2.0 MB
 }
 
 # PROJECT_APPS = {}

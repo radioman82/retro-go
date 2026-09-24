@@ -93,13 +93,15 @@ static int scan_saves_cb(const rg_scandir_t *entry, void *arg) {
     retro_app_t *app = (retro_app_t *)arg;
     size_t name_len = strlen(entry->basename);
 
-    if (name_len < 4) return RG_SCANDIR_CONTINUE;
+    if (name_len < 4)
+      return RG_SCANDIR_CONTINUE;
 
     for (size_t i = 0; i < app->files_count; i++) {
       retro_file_t *file = &app->files[i];
       // Optimization: Only do heavy strncmp if the first characters match.
       // This is safe because save names usually match the ROM name prefix.
-      if (entry->basename[0] == file->name[0] && strncmp(entry->basename, file->name, strlen(file->name)) == 0) {
+      if (entry->basename[0] == file->name[0] &&
+          strncmp(entry->basename, file->name, strlen(file->name)) == 0) {
         file->saves++;
         break;
       }
@@ -278,7 +280,6 @@ static void crc_cache_update(retro_file_t *file) {
       index = crc_cache->count++;
     else
       index = rand() % CRC_CACHE_MAX_ENTRIES;
-
   }
 
   crc_cache->magic = CRC_CACHE_MAGIC;
@@ -428,16 +429,16 @@ static void event_handler(gui_event_t event, tab_t *tab) {
 
     tab_refresh(tab, selected ? selected->name : NULL);
   } else if (event == TAB_DEINIT) {
-      if (app && app->initialized) {
-        rg_bucket_free(app->filenames);
-        app->filenames = rg_bucket_create(4096);
-        if (app->files)
-          free(app->files);
-        app->files = NULL;
-        app->files_count = 0;
-        app->files_capacity = 0;
-        app->initialized = false;
-      }
+    if (app && app->initialized) {
+      rg_bucket_free(app->filenames);
+      app->filenames = rg_bucket_create(4096);
+      if (app->files)
+        free(app->files);
+      app->files = NULL;
+      app->files_count = 0;
+      app->files_capacity = 0;
+      app->initialized = false;
+    }
   } else if (event == TAB_REFRESH) {
     tab_refresh(tab, NULL);
   } else if (event == TAB_ENTER) {
@@ -714,8 +715,6 @@ void applications_init(void) {
   application("Sega Master System", "sms", "sms sg zip", "retro-core", 0);
   application("Atari Lynx", "lnx", "lnx zip", "retro-core", 64);
   application("DOOM", "doom", "wad zip", "prboom-go", 0);
-  application("Quake", "quake", "quake pak", "quake-go", 0);
-  application("Wolfenstein 3D", "wolf3d", "w3d wl6 wl1 sod zip", "wolf4sdl", 0);
 
   application("Nintendo Game & Watch", "gw", "gw", "retro-core", 0);
   // application("Sega Master System", "sms", "sms sg zip", "retro-core", 0);
@@ -726,6 +725,7 @@ void applications_init(void) {
   // application("Neo Geo Pocket Color", "ngp", "ngp ngc zip", "ngpocket-go",
   // 0);
   application("MSX", "msx", "rom mx1 mx2 dsk", "fmsx", 0);
+  application("Amiga 500", "a500", "adf zip", "a500", 0);
 
   // Special app to bootstrap native esp32 binaries from the SD card
   // application("Bootstrap", "apps", "bin elf", "bootstrap", 0);

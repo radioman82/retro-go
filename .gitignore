@@ -27,3 +27,11 @@ REF/
 vmupro-gnuboy-main (example)/
 
 build_output*.log
+
+# Scratch backups and experiment artifacts
+backup_stand_*/
+a500_debug.txt
+test_part.bin
+tools/uae4all-rpi/
+a500/workbench/
+*.adf

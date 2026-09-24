@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.5)
+set(COMPONENTS "main retro-go a500")
+set(RG_ENABLE_NETWORKING 0)
+set(RG_ENABLE_NETPLAY 0)
+set(RG_BUILD_TARGET "RG_TARGET_ESP32_S3_DEVKIT" CACHE STRING "Forced target")
+include(../base.cmake)
+project(a500)
